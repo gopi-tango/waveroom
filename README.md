@@ -20,6 +20,12 @@ the official YouTube embed, and the server only synchronizes *state*
 - **Here now** lists everyone in the room. Someone who closes the tab drops
   off after about 12 seconds. The host can remove a listener; a removed
   person can't rejoin from that browser.
+- **Add many at once** (host): copy a ready-made prompt with your language,
+  mood and era filled in, paste it into Claude or ChatGPT, paste the reply
+  back. Waveroom looks every link up on YouTube and shows what it actually
+  found next to what the list claimed, so wrong or dead links can be dropped
+  before anything is added. No API key needed. AI-written YouTube links are
+  often wrong, which is why the review step exists.
 - **Chat** keeps the last 50 messages while the room is open.
 - **End session** (host only) clears the queue, chat, and listeners, shows
   everyone a "host ended the session" screen, and forgets the host token.

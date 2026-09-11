@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Logo from "../../logo";
+import BulkAdd from "./bulk-add";
 
 const POLL_MS = 3000; // everyone syncs with the room on this beat
 const DRIFT_TOLERANCE = 1.75; // seconds before a listener re-seeks
@@ -106,7 +107,7 @@ export default function RoomPage() {
   }, []);
 
   const post = useCallback(
-    async (payload) => {
+    async (payload, { raw = false } = {}) => {
       const m = meRef.current || {};
       const res = await fetch(`/api/rooms/${code}`, {
         method: "POST",
@@ -119,15 +120,27 @@ export default function RoomPage() {
         }),
       });
       const data = await res.json().catch(() => ({}));
-      return apply(res, data);
+      if (!raw) return apply(res, data);
+      // raw: the response isn't room state (e.g. a link check), so don't
+      // store it as such — but still honour the room going away.
+      if (res.status === 404) {
+        setStatus("notfound");
+        return null;
+      }
+      if (data && data.ended) {
+        if (!leavingRef.current) setStatus("ended");
+        return null;
+      }
+      if (!res.ok) throw new Error(data?.error || "Something went wrong. Try again.");
+      return data;
     },
     [code, apply]
   );
 
   // Requests run one at a time so a heartbeat never overlaps a queue edit.
   const act = useCallback(
-    (payload) => {
-      const run = chainRef.current.then(() => post(payload));
+    (payload, opts) => {
+      const run = chainRef.current.then(() => post(payload, opts));
       chainRef.current = run.catch(() => {});
       return run;
     },
@@ -593,6 +606,7 @@ export default function RoomPage() {
               </form>
             )}
             {addError && <p className="form-error">{addError}</p>}
+            {isHost && <BulkAdd act={act} />}
 
             <ol className="tracks">
               {queue.map((t, i) => (

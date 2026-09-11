@@ -16,6 +16,8 @@ export const dynamic = "force-dynamic";
 
 const HOST_ACTIONS = new Set([
   "addTrack",
+  "checkLinks",
+  "addTracks",
   "removeTrack",
   "moveTrack",
   "playback",
@@ -24,6 +26,9 @@ const HOST_ACTIONS = new Set([
   "end",
 ]);
 const OPEN_ACTIONS = new Set(["sync", "chat"]);
+
+const MAX_BULK = 30; // links checked or added in one go
+const MAX_QUEUE = 100;
 
 const json = (data, status = 200) => NextResponse.json(data, { status });
 
@@ -52,7 +57,7 @@ async function fetchMeta(videoId) {
       `https://www.youtube.com/oembed?url=${encodeURIComponent(
         `https://www.youtube.com/watch?v=${videoId}`
       )}&format=json`,
-      { cache: "no-store" }
+      { cache: "no-store", signal: AbortSignal.timeout(6000) }
     );
     if (!res.ok) return null;
     const data = await res.json();
@@ -64,6 +69,85 @@ async function fetchMeta(videoId) {
   } catch {
     return null;
   }
+}
+
+// ---------- bulk paste ----------
+//
+// Accepts whatever an AI assistant (or a person) pasted: one song per line in
+// "Title — Artist — link" shape, a bare list of links, markdown bullets, etc.
+// Returns each distinct video with the text that was claimed for it.
+
+const URL_RE = /https?:\/\/[^\s<>"'()\]]+/g;
+
+function parseBulk(text) {
+  const items = [];
+  const seen = new Set();
+  const lines = String(text || "").split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const urls = line.match(URL_RE) || [];
+    // A line with nothing but an 11-char id also counts.
+    const candidates = urls.length ? urls : /^[\w-]{11}$/.test(line) ? [line] : [];
+    if (!candidates.length) continue;
+    let claimed = line;
+    for (const u of urls) claimed = claimed.replace(u, " ");
+    claimed = claimed
+      .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "") // list markers
+      .replace(/[*_`#>]/g, "") // markdown
+      .replace(/[—–|:]+/g, " - ")
+      .replace(/\s*-\s*$/, "")
+      .replace(/^\s*-\s*/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
+    for (const u of candidates) {
+      const videoId = extractVideoId(u);
+      if (!videoId || seen.has(videoId)) continue;
+      seen.add(videoId);
+      items.push({ videoId, url: u, claimed });
+      if (items.length >= MAX_BULK) return items;
+    }
+  }
+  return items;
+}
+
+const NOISE = new Set([
+  "official",
+  "video",
+  "audio",
+  "lyric",
+  "lyrics",
+  "song",
+  "songs",
+  "full",
+  "hd",
+  "4k",
+  "remaster",
+  "remastered",
+  "the",
+  "and",
+  "feat",
+  "ft",
+  "from",
+  "with",
+]);
+
+function tokens(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !NOISE.has(w));
+}
+
+// Does what YouTube returned look like the song the line claimed?
+function looksLikeMatch(claimed, meta) {
+  const want = tokens(claimed);
+  if (want.length === 0) return null;
+  const have = new Set(tokens(`${meta.title} ${meta.author}`));
+  const hits = want.filter((w) => have.has(w)).length;
+  return hits >= Math.max(1, Math.ceil(want.length * 0.4));
 }
 
 function respond(room, live) {
@@ -162,6 +246,63 @@ export async function POST(req, { params }) {
         thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
       };
       room.queue.push({ id: crypto.randomUUID(), videoId, ...meta });
+      room.version++;
+      break;
+    }
+
+    case "checkLinks": {
+      // Read-only: look every pasted link up on YouTube so the host can review
+      // before anything lands in the queue. Nothing is written here.
+      const items = parseBulk(body.text);
+      if (items.length === 0) {
+        return json({ error: "No YouTube links found in that text" }, 400);
+      }
+      const queued = new Set(room.queue.map((t) => t.videoId));
+      const results = await Promise.all(
+        items.map(async (it) => ({ it, meta: await fetchMeta(it.videoId) }))
+      );
+      const found = [];
+      const failed = [];
+      for (const { it, meta } of results) {
+        if (meta) {
+          found.push({
+            videoId: it.videoId,
+            ...meta,
+            claimed: it.claimed,
+            match: it.claimed ? looksLikeMatch(it.claimed, meta) : null,
+            inQueue: queued.has(it.videoId),
+          });
+        } else {
+          failed.push({ videoId: it.videoId, url: it.url, claimed: it.claimed });
+        }
+      }
+      return json({ found, failed });
+    }
+
+    case "addTracks": {
+      const list = Array.isArray(body.tracks) ? body.tracks.slice(0, MAX_BULK) : [];
+      const existing = new Set(room.queue.map((t) => t.videoId));
+      let added = 0;
+      for (const t of list) {
+        const videoId =
+          t && typeof t.videoId === "string" && /^[\w-]{11}$/.test(t.videoId)
+            ? t.videoId
+            : null;
+        if (!videoId || existing.has(videoId)) continue;
+        if (room.queue.length >= MAX_QUEUE) break;
+        room.queue.push({
+          id: crypto.randomUUID(),
+          videoId,
+          title: cleanText(t.title, 200) || videoId,
+          author: cleanText(t.author, 100),
+          thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+        });
+        existing.add(videoId);
+        added++;
+      }
+      if (added === 0) {
+        return json({ error: "Nothing new to add. Those songs are already queued." }, 400);
+      }
       room.version++;
       break;
     }
