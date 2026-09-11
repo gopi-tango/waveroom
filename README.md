@@ -66,8 +66,8 @@ Vercel's Hobby function limits are far higher and are not the bottleneck.
 ## Notes & limits
 
 - The YouTube player must stay visible and at least 200×200 px (YouTube's
-  terms don't allow hidden/audio-only embeds), so it's shown as a small
-  320×200 window beside the track title. That is as small as it can go.
+  terms don't allow hidden/audio-only embeds), so it's shown as a 200×200
+  square beside the track title. That is as small as it can go.
 - Browsers block autoplay until the user interacts with the page, so joiners
   enter a name and tap to join first; that tap unlocks playback. If the
   browser still refuses, a "Resume" prompt appears.

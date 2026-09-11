@@ -61,12 +61,18 @@ a:focus-visible {
 /* ---------- shared pieces ---------- */
 
 .wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-family: var(--serif);
   font-weight: 600;
   font-size: 1.2rem;
   letter-spacing: -0.02em;
   color: var(--ink);
   text-decoration: none;
+}
+.wordmark .logo {
+  flex-shrink: 0;
 }
 
 .btn {
@@ -140,6 +146,22 @@ a:focus-visible {
 }
 .field:disabled {
   opacity: 0.5;
+}
+@media (max-width: 640px) {
+  /* 16px stops iOS Safari zooming the page when a field is focused */
+  .field {
+    font-size: 16px;
+  }
+}
+@media (pointer: coarse) {
+  /* thumb-sized targets on touch screens */
+  .btn-icon {
+    padding: 0.55rem 0.7rem;
+    font-size: 0.9rem;
+  }
+  .btn {
+    padding: 0.7rem 1.1rem;
+  }
 }
 
 .tag {
@@ -227,6 +249,10 @@ a:focus-visible {
   font-size: 0.88rem;
   margin-top: 0.8rem;
 }
+.opening {
+  color: var(--muted);
+  margin: 0;
+}
 
 /* ---------- room chrome ---------- */
 
@@ -306,7 +332,16 @@ a:focus-visible {
 .side-col {
   min-width: 0;
   display: grid;
+  /* minmax(0, 1fr): a long unbroken title must never widen the column */
+  grid-template-columns: minmax(0, 1fr);
   gap: 1.75rem;
+}
+.main-col {
+  container-type: inline-size;
+}
+.main-col > section,
+.side-col > section {
+  min-width: 0;
 }
 @media (max-width: 900px) {
   .layout {
@@ -336,8 +371,9 @@ a:focus-visible {
 .stage {
   position: relative;
   display: flex;
-  gap: 1.4rem;
-  padding: 1.4rem;
+  flex-wrap: wrap; /* the body drops below the screen when there's no room beside it */
+  gap: 1.25rem;
+  padding: 1.25rem;
   border-radius: var(--r-panel);
   background: var(--bg-deep);
   border: 1px solid var(--line);
@@ -362,9 +398,10 @@ a:focus-visible {
 
 .screen {
   position: relative;
-  flex: 0 0 320px;
-  width: 320px;
-  height: 200px; /* YouTube's embed minimum is 200x200; this is as small as it goes */
+  /* YouTube's embed terms require at least 200x200. This is the floor. */
+  flex: 0 0 200px;
+  width: 200px;
+  height: 200px;
   border-radius: 8px;
   overflow: hidden;
   background: #000;
@@ -390,13 +427,14 @@ a:focus-visible {
 .stage-body {
   position: relative;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 260px; /* needs at least this much beside the screen, else wraps */
   display: flex;
   flex-direction: column;
 }
 .track-title {
   font-size: clamp(1.4rem, 2.4vw, 1.9rem);
   line-height: 1.15;
+  overflow-wrap: anywhere;
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -446,23 +484,34 @@ a:focus-visible {
   margin: 1rem 0 0;
 }
 
-@media (max-width: 640px) {
+/* Narrow column (phones, or the two-column layout at tablet widths): the
+   body has wrapped under the screen, so tighten type and spacing. */
+@container (max-width: 520px) {
   .stage {
-    flex-direction: column;
     padding: 1rem;
-  }
-  .screen {
-    flex-basis: auto;
-    width: 100%;
-    height: auto;
-    aspect-ratio: 16 / 9;
-    min-height: 200px;
   }
   .track-title {
     font-size: 1.35rem;
   }
   .progress {
     margin-top: 1rem;
+  }
+}
+@media (max-width: 640px) {
+  .stage {
+    padding: 1rem;
+  }
+  .track-title {
+    font-size: 1.35rem;
+  }
+  .progress {
+    margin-top: 1rem;
+  }
+  .controls {
+    flex-wrap: wrap;
+  }
+  .controls .play {
+    flex: 1;
   }
 }
 
@@ -606,7 +655,7 @@ a:focus-visible {
   flex-direction: column;
 }
 .chat-log {
-  height: 340px;
+  height: clamp(220px, 42vh, 420px);
   overflow-y: auto;
   padding-right: 0.3rem;
   scroll-behavior: smooth;
@@ -695,6 +744,24 @@ a:focus-visible {
 .door .btn {
   width: 100%;
   padding: 0.75rem 1rem;
+}
+@media (max-width: 480px) {
+  .overlay {
+    padding: 1rem;
+  }
+  .door {
+    padding: 1.4rem 1.2rem;
+  }
+  .door h2 {
+    font-size: 1.55rem;
+  }
+  .room {
+    padding: 0.75rem 1rem 2.5rem;
+  }
+  .bar-right {
+    width: 100%;
+    justify-content: space-between;
+  }
 }
 
 @media (prefers-reduced-motion: no-preference) {

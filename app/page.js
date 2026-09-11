@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Logo from "./logo";
 
 export default function Home() {
   const router = useRouter();
@@ -15,7 +16,7 @@ export default function Home() {
     try {
       const res = await fetch("/api/rooms", { method: "POST" });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Could not create room");
+      if (!res.ok) throw new Error(data.error || "Couldn't start a room. Try again.");
       localStorage.setItem(`waveroom:host:${data.code}`, data.hostToken);
       router.push(`/room/${data.code}`);
     } catch (e) {
@@ -42,11 +43,14 @@ export default function Home() {
   return (
     <main className="home">
       <div className="home-card">
-        <span className="wordmark">Waveroom</span>
+        <span className="wordmark">
+          <Logo />
+          Waveroom
+        </span>
         <h1>Same song, same second, with your friends.</h1>
         <p className="lede">
-          Queue up YouTube links and listen together in sync. Up to ten
-          people, a name, and a chat.
+          Paste YouTube links, share a code, and everyone hears the same
+          moment. Room for ten friends, with chat.
         </p>
 
         <div className="home-actions">

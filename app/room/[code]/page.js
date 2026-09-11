@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import Logo from "../../logo";
 
 const POLL_MS = 3000; // everyone syncs with the room on this beat
 const DRIFT_TOLERANCE = 1.75; // seconds before a listener re-seeks
@@ -44,6 +45,7 @@ export default function RoomPage() {
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [ending, setEnding] = useState(false);
+  const [canShare, setCanShare] = useState(false);
   const [, setTick] = useState(0); // drives the progress bar
 
   const playerRef = useRef(null);
@@ -78,6 +80,7 @@ export default function RoomPage() {
     meRef.current = m;
     setMe(m);
     setNameInput(name);
+    setCanShare(typeof navigator !== "undefined" && typeof navigator.share === "function");
   }, [code]);
 
   // ---------- server helpers ----------
@@ -95,7 +98,7 @@ export default function RoomPage() {
       setStatus("kicked");
       return null;
     }
-    if (!res.ok) throw new Error(data?.error || "Something went wrong");
+    if (!res.ok) throw new Error(data?.error || "Something went wrong. Try again.");
     fetchedAtRef.current = Date.now();
     setRoom(data);
     setStatus("ok");
@@ -307,6 +310,16 @@ export default function RoomPage() {
     return () => clearInterval(id);
   }, [joined, status, isHost, act, expectedPosition]);
 
+  // Coming back to a backgrounded tab: catch up right away instead of waiting a beat.
+  useEffect(() => {
+    if (!joined || status !== "ok") return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") act({ action: "sync" }).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [joined, status, act]);
+
   // Progress bar tick
   useEffect(() => {
     if (!joined) return;
@@ -314,11 +327,16 @@ export default function RoomPage() {
     return () => clearInterval(id);
   }, [joined]);
 
-  // Keep the chat pinned to the newest message
+  // Follow new messages, but don't yank someone who scrolled up to read.
+  const lastMsg = messages[messages.length - 1];
   useEffect(() => {
     const el = chatLogRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    const mine = lastMsg && me && lastMsg.clientId === me.clientId;
+    if (nearBottom || mine) el.scrollTop = el.scrollHeight;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastMsg?.id]);
 
   // ---------- actions ----------
 
@@ -382,7 +400,7 @@ export default function RoomPage() {
   }
 
   async function endSession() {
-    if (!window.confirm("End the session? Everyone is disconnected and the queue is cleared.")) return;
+    if (!window.confirm("End the session for everyone? The queue and chat are cleared.")) return;
     setEnding(true);
     leavingRef.current = true;
     try {
@@ -394,18 +412,40 @@ export default function RoomPage() {
     router.push("/");
   }
 
-  function copyLink() {
-    navigator.clipboard
-      .writeText(window.location.href)
-      .then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1600);
-      })
-      .catch(() => {});
+  function removeListener(l) {
+    if (!window.confirm(`Remove ${l.name} from the room?`)) return;
+    act({ action: "kick", targetId: l.clientId }).catch(() => {});
+  }
+
+  async function shareLink() {
+    const link = window.location.href;
+    // Phones: the native share sheet. Elsewhere: clipboard, then a last-resort prompt.
+    if (canShare) {
+      try {
+        await navigator.share({ title: `Waveroom ${code}`, url: link });
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      window.prompt("Copy this link", link);
+    }
   }
 
   // ---------- render ----------
 
+  if (status === "loading" || !me) {
+    return (
+      <main className="home">
+        <p className="opening">Opening room {code}…</p>
+      </main>
+    );
+  }
   if (status === "notfound") {
     return (
       <Notice title="This room doesn't exist">
@@ -423,7 +463,7 @@ export default function RoomPage() {
   if (status === "kicked") {
     return (
       <Notice title="You've been removed from this room">
-        The host closed the door. You can still start your own room.
+        The host removed you. You can still start a room of your own.
       </Notice>
     );
   }
@@ -439,6 +479,7 @@ export default function RoomPage() {
     <main className="room">
       <header className="bar">
         <a className="wordmark" href="/">
+          <Logo />
           Waveroom
         </a>
         <div className="bar-right">
@@ -446,9 +487,11 @@ export default function RoomPage() {
             <span className="dot" />
             {room?.isPlaying ? "On air" : "Quiet"}
           </span>
-          <button className="invite" onClick={copyLink} title="Copy the invite link">
+          <button className="invite" onClick={shareLink} title="Share the invite link">
             <span className="invite-code">{code}</span>
-            <span className="invite-hint">{copied ? "Link copied" : "Copy invite"}</span>
+            <span className="invite-hint">
+              {copied ? "Link copied" : canShare ? "Share invite" : "Copy invite"}
+            </span>
           </button>
           {isHost && joined && (
             <button className="btn btn-quiet" onClick={endSession} disabled={ending}>
@@ -464,9 +507,7 @@ export default function RoomPage() {
             <div className="screen">
               <div id="yt-player" />
               {(!room || queue.length === 0) && (
-                <div className="screen-empty">
-                  {isHost ? "Your queue is empty." : "Nothing playing yet."}
-                </div>
+                <div className="screen-empty">Nothing playing</div>
               )}
             </div>
 
@@ -489,11 +530,11 @@ export default function RoomPage() {
               ) : (
                 <>
                   <h1 className="track-title quiet">
-                    {isHost ? "The room is open." : "Waiting for the first track."}
+                    {isHost ? "Your room is open." : "Waiting for the first track."}
                   </h1>
                   <p className="track-author">
                     {isHost
-                      ? "Paste a YouTube link below and press play."
+                      ? "Paste a YouTube link into the queue, then press Play."
                       : "The host is picking something."}
                   </p>
                 </>
@@ -524,14 +565,14 @@ export default function RoomPage() {
                   </button>
                 </div>
               ) : (
-                <p className="note">The host is driving. You stay in sync automatically.</p>
+                <p className="note">The host controls playback. You stay in sync.</p>
               )}
             </div>
           </section>
 
           <section className="queue">
             <div className="section-head">
-              <h2>Up next</h2>
+              <h2>Queue</h2>
               <span className="count">
                 {queue.length} {queue.length === 1 ? "track" : "tracks"}
               </span>
@@ -601,9 +642,7 @@ export default function RoomPage() {
               ))}
               {room && queue.length === 0 && (
                 <li className="tracks-empty">
-                  {isHost
-                    ? "Nothing queued yet. Add a link to get started."
-                    : "Nothing queued yet."}
+                  {isHost ? "Nothing queued yet. Paste a link above." : "Nothing queued yet."}
                 </li>
               )}
             </ol>
@@ -632,8 +671,8 @@ export default function RoomPage() {
                     {isHost && !l.host && !isMe && (
                       <button
                         className="btn-icon"
-                        title={`Remove ${l.name}`}
-                        onClick={() => act({ action: "kick", targetId: l.clientId })}
+                        title={`Remove ${l.name} from the room`}
+                        onClick={() => removeListener(l)}
                       >
                         Remove
                       </button>
@@ -641,8 +680,10 @@ export default function RoomPage() {
                   </li>
                 );
               })}
-              {joined && listeners.length === 0 && (
-                <li className="people-empty">Just you so far. Share the invite.</li>
+              {joined && listeners.length <= 1 && (
+                <li className="people-empty">
+                  Just you so far. Share the invite from the top bar.
+                </li>
               )}
             </ul>
           </section>
@@ -724,7 +765,7 @@ export default function RoomPage() {
         <div className="overlay">
           <div className="door">
             <h2>Your browser paused playback</h2>
-            <p className="door-lede">Tap once to pick up where everyone is.</p>
+            <p className="door-lede">Tap to catch up with everyone.</p>
             <button
               className="btn btn-accent"
               onClick={() => {
@@ -746,6 +787,7 @@ function Notice({ title, children }) {
     <main className="home">
       <div className="home-card">
         <a className="wordmark" href="/">
+          <Logo />
           Waveroom
         </a>
         <h1 className="notice-title">{title}</h1>

@@ -1,9 +1,9 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Waveroom — listen together",
+  title: "Waveroom",
   description:
-    "Paste YouTube links into a queue and listen in sync with friends.",
+    "Queue up YouTube links and listen together in sync with friends.",
 };
 
 export default function RootLayout({ children }) {
