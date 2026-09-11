@@ -1,7 +1,31 @@
 import { NextResponse } from "next/server";
-import { getRoom, setRoom, publicRoom } from "../../../../lib/store";
+import {
+  getRoom,
+  setRoom,
+  publicRoom,
+  syncLive,
+  removeListener,
+  clearLive,
+  cleanName,
+  cleanText,
+  ENDED_TTL_SECONDS,
+  MAX_KICKED,
+} from "../../../../lib/store";
 
 export const dynamic = "force-dynamic";
+
+const HOST_ACTIONS = new Set([
+  "addTrack",
+  "removeTrack",
+  "moveTrack",
+  "playback",
+  "advance",
+  "kick",
+  "end",
+]);
+const OPEN_ACTIONS = new Set(["sync", "chat"]);
+
+const json = (data, status = 200) => NextResponse.json(data, { status });
 
 function extractVideoId(input) {
   const s = (input || "").trim();
@@ -42,38 +66,95 @@ async function fetchMeta(videoId) {
   }
 }
 
+function respond(room, live) {
+  return json({
+    ...publicRoom(room),
+    listeners: live.listeners,
+    messages: live.messages,
+  });
+}
+
+// Pre-join view: room info + who's here. One Redis command.
 export async function GET(_req, { params }) {
-  const room = await getRoom(params.code.toUpperCase());
-  if (!room) {
-    return NextResponse.json({ error: "Room not found" }, { status: 404 });
-  }
-  return NextResponse.json(publicRoom(room));
+  const code = params.code.toUpperCase();
+  const live = await syncLive(code, { wantRoom: true });
+  if (!live.room) return json({ error: "Room not found" }, 404);
+  if (live.room.ended) return json({ ended: true, code });
+  return respond(live.room, live);
 }
 
 export async function POST(req, { params }) {
   const code = params.code.toUpperCase();
-  const room = await getRoom(code);
-  if (!room) {
-    return NextResponse.json({ error: "Room not found" }, { status: 404 });
-  }
-
   const body = await req.json().catch(() => ({}));
-  const { action, hostToken } = body;
+  const action = body.action;
+  const hostToken = typeof body.hostToken === "string" ? body.hostToken : "";
+  const clientId =
+    typeof body.clientId === "string" ? body.clientId.slice(0, 64) : "";
+  const name = cleanName(body.name);
+  const now = Date.now();
 
-  if (hostToken !== room.hostToken) {
-    return NextResponse.json({ error: "Host only" }, { status: 403 });
+  if (!HOST_ACTIONS.has(action) && !OPEN_ACTIONS.has(action)) {
+    return json({ error: "Unknown action" }, 400);
   }
 
-  const now = Date.now();
+  // ---------- anyone in the room: poll / chat ----------
+
+  if (action === "sync") {
+    if (!clientId || !name) return json({ error: "Tell us your name first" }, 400);
+    // Presence is written in the same command that reads the room, so the
+    // host claim is checked afterwards and undone if it was false.
+    const live = await syncLive(code, {
+      clientId,
+      name,
+      host: !!hostToken,
+      wantRoom: true,
+    });
+    const room = live.room;
+    if (!room) return json({ error: "Room not found" }, 404);
+    if (room.ended) return json({ ended: true, code });
+    if (hostToken && hostToken !== room.hostToken) {
+      await removeListener(code, clientId);
+      return json({ error: "Host only" }, 403);
+    }
+    if ((room.kicked || []).includes(clientId)) {
+      await removeListener(code, clientId);
+      return json({ error: "kicked" }, 403);
+    }
+    return respond(room, live);
+  }
+
+  if (action === "chat") {
+    if (!clientId || !name) return json({ error: "Tell us your name first" }, 400);
+    const text = cleanText(body.text);
+    if (!text) return json({ error: "Type something first" }, 400);
+    const room = await getRoom(code);
+    if (!room) return json({ error: "Room not found" }, 404);
+    if (room.ended) return json({ ended: true, code });
+    if ((room.kicked || []).includes(clientId)) return json({ error: "kicked" }, 403);
+    const isHost = !!hostToken && hostToken === room.hostToken;
+    const live = await syncLive(code, {
+      clientId,
+      name,
+      host: isHost,
+      message: { id: crypto.randomUUID(), clientId, name, host: isHost, text, at: now },
+    });
+    return respond(room, live);
+  }
+
+  // ---------- host only ----------
+
+  const room = await getRoom(code);
+  if (!room) return json({ error: "Room not found" }, 404);
+  if (room.ended) return json({ ended: true, code });
+  if (!hostToken || hostToken !== room.hostToken) {
+    return json({ error: "Host only" }, 403);
+  }
 
   switch (action) {
     case "addTrack": {
       const videoId = extractVideoId(body.url);
       if (!videoId) {
-        return NextResponse.json(
-          { error: "That doesn't look like a YouTube link" },
-          { status: 400 }
-        );
+        return json({ error: "That doesn't look like a YouTube link" }, 400);
       }
       const meta = (await fetchMeta(videoId)) || {
         title: videoId,
@@ -97,7 +178,6 @@ export async function POST(req, { params }) {
         room.positionAt = now;
         if (room.currentIndex >= room.queue.length) {
           room.currentIndex = Math.max(0, room.queue.length - 1);
-          room.isPlaying = room.queue.length > 0 && room.isPlaying;
         }
         if (room.queue.length === 0) room.isPlaying = false;
       }
@@ -150,10 +230,25 @@ export async function POST(req, { params }) {
       break;
     }
 
-    default:
-      return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+    case "kick": {
+      const target = typeof body.targetId === "string" ? body.targetId : "";
+      if (!target || target === clientId) break;
+      room.kicked = [...(room.kicked || []).filter((k) => k !== target), target].slice(
+        -MAX_KICKED
+      );
+      await removeListener(code, target);
+      break;
+    }
+
+    case "end": {
+      // Everyone polling sees {ended:true}; the notice expires on its own.
+      await setRoom(code, { code, ended: true, endedAt: now }, ENDED_TTL_SECONDS);
+      await clearLive(code);
+      return json({ ended: true, code });
+    }
   }
 
   await setRoom(code, room);
-  return NextResponse.json(publicRoom(room));
+  const live = await syncLive(code, { clientId, name, host: true });
+  return respond(room, live);
 }

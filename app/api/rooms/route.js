@@ -18,6 +18,7 @@ export async function POST() {
     position: 0,
     positionAt: Date.now(),
     version: 0,
+    kicked: [],
   };
   await setRoom(code, room);
   return NextResponse.json({ code, hostToken });

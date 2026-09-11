@@ -34,7 +34,7 @@ export default function Home() {
     if (res.ok) {
       router.push(`/room/${c}`);
     } else {
-      setError("No room with that code — check it and try again.");
+      setError("No room with that code. Check it and try again.");
       setBusy(false);
     }
   }
@@ -42,12 +42,11 @@ export default function Home() {
   return (
     <main className="home">
       <div className="home-card">
-        <h1>
-          Wave<em>room</em>
-        </h1>
+        <span className="wordmark">Waveroom</span>
+        <h1>Same song, same second, with your friends.</h1>
         <p className="lede">
-          Queue up YouTube links and listen in sync with friends — everyone
-          hears the same song at the same moment.
+          Queue up YouTube links and listen together in sync. Up to ten
+          people, a name, and a chat.
         </p>
 
         <div className="home-actions">
@@ -60,7 +59,7 @@ export default function Home() {
           <form className="join-row" onSubmit={joinRoom}>
             <input
               className="field"
-              placeholder="ROOM CODE"
+              placeholder="Room code"
               value={code}
               maxLength={6}
               onChange={(e) => setCode(e.target.value)}

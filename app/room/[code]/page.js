@@ -1,10 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 
-const POLL_MS = 2000; // listeners fetch room state
-const HEARTBEAT_MS = 3000; // host pushes its player position
+const POLL_MS = 3000; // everyone syncs with the room on this beat
 const DRIFT_TOLERANCE = 1.75; // seconds before a listener re-seeks
 
 function fmt(t) {
@@ -14,71 +13,140 @@ function fmt(t) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function clock(ms) {
+  try {
+    return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function newId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
 export default function RoomPage() {
   const { code: rawCode } = useParams();
+  const router = useRouter();
   const code = String(rawCode || "").toUpperCase();
 
+  const [me, setMe] = useState(null); // { clientId, name, hostToken }
   const [room, setRoom] = useState(null);
-  const [notFound, setNotFound] = useState(false);
+  const [status, setStatus] = useState("loading"); // loading | ok | notfound | ended | kicked
   const [joined, setJoined] = useState(false);
   const [blocked, setBlocked] = useState(false); // autoplay blocked → tap to resume
   const [copied, setCopied] = useState(false);
+  const [nameInput, setNameInput] = useState("");
   const [url, setUrl] = useState("");
   const [addError, setAddError] = useState("");
   const [adding, setAdding] = useState(false);
-  const [tick, setTick] = useState(0); // drives the progress bar
+  const [chatInput, setChatInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [ending, setEnding] = useState(false);
+  const [, setTick] = useState(0); // drives the progress bar
 
   const playerRef = useRef(null);
   const playerReadyRef = useRef(false);
   const loadedVideoRef = useRef(null);
   const roomRef = useRef(null);
-  const hostTokenRef = useRef(null);
+  const meRef = useRef(null);
   const fetchedAtRef = useRef(0);
-
-  const isHost = !!hostTokenRef.current;
-
-  useEffect(() => {
-    hostTokenRef.current = localStorage.getItem(`waveroom:host:${code}`);
-  }, [code]);
+  const chainRef = useRef(Promise.resolve());
+  const leavingRef = useRef(false);
+  const chatLogRef = useRef(null);
 
   roomRef.current = room;
 
+  const isHost = !!(me && me.hostToken);
+  const listeners = room?.listeners || [];
+  const messages = room?.messages || [];
   const currentTrack =
-    room && room.queue.length > 0 ? room.queue[room.currentIndex] : null;
+    room && room.queue?.length > 0 ? room.queue[room.currentIndex] : null;
+
+  // ---------- who am I ----------
+
+  useEffect(() => {
+    let clientId = localStorage.getItem("waveroom:client");
+    if (!clientId) {
+      clientId = newId();
+      localStorage.setItem("waveroom:client", clientId);
+    }
+    const name = localStorage.getItem("waveroom:name") || "";
+    const hostToken = localStorage.getItem(`waveroom:host:${code}`) || "";
+    const m = { clientId, name, hostToken };
+    meRef.current = m;
+    setMe(m);
+    setNameInput(name);
+  }, [code]);
 
   // ---------- server helpers ----------
 
-  const refresh = useCallback(async () => {
-    const res = await fetch(`/api/rooms/${code}`, { cache: "no-store" });
+  const apply = useCallback((res, data) => {
     if (res.status === 404) {
-      setNotFound(true);
+      setStatus("notfound");
       return null;
     }
-    const data = await res.json();
+    if (data && data.ended) {
+      if (!leavingRef.current) setStatus("ended");
+      return null;
+    }
+    if (res.status === 403 && data?.error === "kicked") {
+      setStatus("kicked");
+      return null;
+    }
+    if (!res.ok) throw new Error(data?.error || "Something went wrong");
     fetchedAtRef.current = Date.now();
     setRoom(data);
+    setStatus("ok");
     return data;
-  }, [code]);
+  }, []);
 
-  const act = useCallback(
+  const post = useCallback(
     async (payload) => {
+      const m = meRef.current || {};
       const res = await fetch(`/api/rooms/${code}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostToken: hostTokenRef.current, ...payload }),
+        body: JSON.stringify({
+          hostToken: m.hostToken || undefined,
+          clientId: m.clientId,
+          name: m.name,
+          ...payload,
+        }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Request failed");
-      fetchedAtRef.current = Date.now();
-      setRoom(data);
-      return data;
+      const data = await res.json().catch(() => ({}));
+      return apply(res, data);
     },
-    [code]
+    [code, apply]
   );
 
+  // Requests run one at a time so a heartbeat never overlaps a queue edit.
+  const act = useCallback(
+    (payload) => {
+      const run = chainRef.current.then(() => post(payload));
+      chainRef.current = run.catch(() => {});
+      return run;
+    },
+    [post]
+  );
+
+  // First look at the room, before joining.
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/rooms/${code}`, { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+        if (!cancelled) apply(res, data);
+      } catch {
+        if (!cancelled) setStatus("notfound");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [code, apply]);
 
   // ---------- YouTube player ----------
 
@@ -93,25 +161,25 @@ export default function RoomPage() {
     const r = roomRef.current;
     const track = r && r.queue.length > 0 ? r.queue[r.currentIndex] : null;
 
+    // Passing `videoId: undefined` makes the YouTube API throw "Invalid video
+    // id", so the key is only present when there is something to load.
     playerRef.current = new window.YT.Player("yt-player", {
       width: "100%",
       height: "100%",
-      videoId: track ? track.videoId : undefined,
+      ...(track ? { videoId: track.videoId } : {}),
       playerVars: {
         controls: 0,
         disablekb: 1,
         rel: 0,
         playsinline: 1,
-        origin:
-          typeof window !== "undefined" ? window.location.origin : undefined,
+        origin: typeof window !== "undefined" ? window.location.origin : undefined,
       },
       events: {
         onReady: () => {
           playerReadyRef.current = true;
           if (track) {
             loadedVideoRef.current = track.videoId;
-            const pos = expectedPosition();
-            playerRef.current.seekTo(pos, true);
+            playerRef.current.seekTo(expectedPosition(), true);
             if (r.isPlaying) playerRef.current.playVideo();
           }
         },
@@ -119,11 +187,7 @@ export default function RoomPage() {
           const YT = window.YT;
           if (e.data === YT.PlayerState.PLAYING) setBlocked(false);
           // Host advances the queue when a track ends
-          if (
-            e.data === YT.PlayerState.ENDED &&
-            hostTokenRef.current &&
-            roomRef.current
-          ) {
+          if (e.data === YT.PlayerState.ENDED && meRef.current?.hostToken && roomRef.current) {
             act({ action: "advance" }).catch(() => {});
           }
         },
@@ -131,8 +195,7 @@ export default function RoomPage() {
     });
   }, [act, expectedPosition]);
 
-  const join = useCallback(() => {
-    setJoined(true);
+  const loadPlayer = useCallback(() => {
     if (window.YT && window.YT.Player) {
       createPlayer();
       return;
@@ -150,20 +213,53 @@ export default function RoomPage() {
     }
   }, [createPlayer]);
 
-  // ---------- sync loop ----------
+  function join(e) {
+    e.preventDefault();
+    const name = nameInput.replace(/\s+/g, " ").trim().slice(0, 24);
+    if (!name) return;
+    localStorage.setItem("waveroom:name", name);
+    const m = { ...(meRef.current || {}), name };
+    meRef.current = m;
+    setMe(m);
+    setJoined(true);
+    loadPlayer();
+    // Show up in the room right away instead of waiting for the first beat.
+    act({ action: "sync" }).catch(() => {});
+  }
+
+  // ---------- the beat: everyone syncs every POLL_MS ----------
 
   useEffect(() => {
-    if (!joined) return;
+    if (!joined || status !== "ok") return;
 
     const id = setInterval(async () => {
-      const r = isHost ? roomRef.current : await refresh();
-      if (!r) return;
-
       const p = playerRef.current;
-      if (!p || !playerReadyRef.current) return;
+      const ready = !!p && playerReadyRef.current;
+      const YT = window.YT;
+
+      let r;
+      try {
+        if (isHost) {
+          const cur = roomRef.current;
+          if (ready && cur && cur.queue.length > 0) {
+            // Host's player is the source of truth: publish where it is.
+            r = await act({
+              action: "playback",
+              position: p.getCurrentTime() || 0,
+              isPlaying: p.getPlayerState() === YT.PlayerState.PLAYING,
+            });
+          } else {
+            r = await act({ action: "sync" });
+          }
+        } else {
+          r = await act({ action: "sync" });
+        }
+      } catch {
+        return;
+      }
+      if (!r || !ready) return;
 
       const track = r.queue.length > 0 ? r.queue[r.currentIndex] : null;
-      const YT = window.YT;
       const state = p.getPlayerState ? p.getPlayerState() : -1;
 
       // Nothing to play
@@ -181,20 +277,15 @@ export default function RoomPage() {
         return;
       }
 
-      if (isHost) return; // host's player is the source of truth
+      if (isHost) return;
 
       // Listener drift correction
       const expected = expectedPosition();
       const actual = p.getCurrentTime ? p.getCurrentTime() : 0;
 
       if (r.isPlaying) {
-        if (Math.abs(actual - expected) > DRIFT_TOLERANCE) {
-          p.seekTo(expected, true);
-        }
-        if (
-          state !== YT.PlayerState.PLAYING &&
-          state !== YT.PlayerState.BUFFERING
-        ) {
+        if (Math.abs(actual - expected) > DRIFT_TOLERANCE) p.seekTo(expected, true);
+        if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING) {
           p.playVideo();
           // If the browser refuses (no gesture registered), surface a tap prompt
           setTimeout(() => {
@@ -214,28 +305,7 @@ export default function RoomPage() {
     }, POLL_MS);
 
     return () => clearInterval(id);
-  }, [joined, isHost, refresh, expectedPosition]);
-
-  // Host heartbeat: publish player position so listeners can sync
-  useEffect(() => {
-    if (!joined || !isHost) return;
-    const id = setInterval(() => {
-      const p = playerRef.current;
-      const r = roomRef.current;
-      if (!p || !playerReadyRef.current || !r || r.queue.length === 0) {
-        refresh();
-        return;
-      }
-      const YT = window.YT;
-      const playing = p.getPlayerState() === YT.PlayerState.PLAYING;
-      act({
-        action: "playback",
-        position: p.getCurrentTime() || 0,
-        isPlaying: playing,
-      }).catch(() => {});
-    }, HEARTBEAT_MS);
-    return () => clearInterval(id);
-  }, [joined, isHost, act, refresh]);
+  }, [joined, status, isHost, act, expectedPosition]);
 
   // Progress bar tick
   useEffect(() => {
@@ -244,7 +314,13 @@ export default function RoomPage() {
     return () => clearInterval(id);
   }, [joined]);
 
-  // ---------- host actions ----------
+  // Keep the chat pinned to the newest message
+  useEffect(() => {
+    const el = chatLogRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages.length]);
+
+  // ---------- actions ----------
 
   async function addTrack(e) {
     e.preventDefault();
@@ -280,18 +356,42 @@ export default function RoomPage() {
     if (!r) return;
     const next = r.currentIndex + delta;
     if (next < 0 || next >= r.queue.length) return;
-    loadedVideoRef.current = null; // force reload in sync loop
-    await act({
-      action: "playback",
-      currentIndex: next,
-      position: 0,
-      isPlaying: true,
-    });
     const p = playerRef.current;
     if (p && playerReadyRef.current) {
       loadedVideoRef.current = r.queue[next].videoId;
       p.loadVideoById(r.queue[next].videoId, 0);
+    } else {
+      loadedVideoRef.current = null;
     }
+    await act({ action: "playback", currentIndex: next, position: 0, isPlaying: true });
+  }
+
+  async function sendChat(e) {
+    e.preventDefault();
+    const text = chatInput.trim();
+    if (!text) return;
+    setSending(true);
+    try {
+      await act({ action: "chat", text });
+      setChatInput("");
+    } catch {
+      // keep the draft so they can retry
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function endSession() {
+    if (!window.confirm("End the session? Everyone is disconnected and the queue is cleared.")) return;
+    setEnding(true);
+    leavingRef.current = true;
+    try {
+      await act({ action: "end" });
+    } catch {
+      // the room may already be gone; leave anyway
+    }
+    localStorage.removeItem(`waveroom:host:${code}`);
+    router.push("/");
   }
 
   function copyLink() {
@@ -306,125 +406,139 @@ export default function RoomPage() {
 
   // ---------- render ----------
 
-  if (notFound) {
+  if (status === "notfound") {
     return (
-      <main className="home">
-        <div className="home-card">
-          <h1>
-            Wave<em>room</em>
-          </h1>
-          <p className="lede">
-            This room doesn't exist (rooms expire after 24 hours of quiet).
-          </p>
-          <a href="/">Start a new one</a>
-        </div>
-      </main>
+      <Notice title="This room doesn't exist">
+        Check the code, or it may have closed after a day of quiet.
+      </Notice>
+    );
+  }
+  if (status === "ended") {
+    return (
+      <Notice title="The host ended the session">
+        Thanks for listening along.
+      </Notice>
+    );
+  }
+  if (status === "kicked") {
+    return (
+      <Notice title="You've been removed from this room">
+        The host closed the door. You can still start your own room.
+      </Notice>
     );
   }
 
   const p = playerRef.current;
-  const dur =
-    joined && p && playerReadyRef.current && p.getDuration
-      ? p.getDuration()
-      : 0;
-  const cur =
-    joined && p && playerReadyRef.current && p.getCurrentTime
-      ? p.getCurrentTime()
-      : 0;
+  const ready = joined && p && playerReadyRef.current;
+  const dur = ready && p.getDuration ? p.getDuration() : 0;
+  const cur = ready && p.getCurrentTime ? p.getCurrentTime() : 0;
+  const queue = room?.queue || [];
+  const others = listeners.length;
 
   return (
     <main className="room">
-      <header className="room-header">
+      <header className="bar">
         <a className="wordmark" href="/">
-          Wave<em>room</em>
+          Waveroom
         </a>
-        <div className="right">
-          <span className={`on-air ${room?.isPlaying ? "" : "idle"}`}>
+        <div className="bar-right">
+          <span className={`live ${room?.isPlaying ? "on" : ""}`}>
             <span className="dot" />
-            {room?.isPlaying ? "ON AIR" : "QUIET"}
+            {room?.isPlaying ? "On air" : "Quiet"}
           </span>
-          <button className="code-chip" onClick={copyLink} title="Copy invite link">
-            <span>{copied ? "copied!" : "room"}</span>
-            {code}
+          <button className="invite" onClick={copyLink} title="Copy the invite link">
+            <span className="invite-code">{code}</span>
+            <span className="invite-hint">{copied ? "Link copied" : "Copy invite"}</span>
           </button>
+          {isHost && joined && (
+            <button className="btn btn-quiet" onClick={endSession} disabled={ending}>
+              {ending ? "Ending…" : "End session"}
+            </button>
+          )}
         </div>
       </header>
 
-      <div className="room-grid">
-        <section className="player-panel">
-          <div className="player-shell">
-            <div id="yt-player" />
-            {(!room || room.queue.length === 0) && (
-              <div className="player-empty">
-                {isHost
-                  ? "Paste a YouTube link on the right to start the queue."
-                  : "Waiting for the host to queue something up…"}
-              </div>
-            )}
-          </div>
-
-          {currentTrack && (
-            <div className="now-playing">
-              <div className="np-title">{currentTrack.title}</div>
-              {currentTrack.author && (
-                <div className="np-author">{currentTrack.author}</div>
+      <div className="layout">
+        <div className="main-col">
+          <section className={`stage ${room?.isPlaying ? "playing" : ""}`}>
+            <div className="screen">
+              <div id="yt-player" />
+              {(!room || queue.length === 0) && (
+                <div className="screen-empty">
+                  {isHost ? "Your queue is empty." : "Nothing playing yet."}
+                </div>
               )}
-              <div className="progress" aria-hidden="true">
-                <div
-                  className="fill"
-                  style={{
-                    width: dur > 0 ? `${Math.min(100, (cur / dur) * 100)}%` : "0%",
-                  }}
-                />
-              </div>
-              <div className="time-row">
-                <span>{fmt(cur)}</span>
-                <span>{fmt(dur)}</span>
-              </div>
             </div>
-          )}
 
-          {isHost ? (
-            <div className="controls">
-              <button
-                className="btn"
-                onClick={() => jump(-1)}
-                disabled={!room || room.currentIndex === 0}
-              >
-                ‹ Prev
-              </button>
-              <button
-                className="btn btn-accent play"
-                onClick={togglePlay}
-                disabled={!room || room.queue.length === 0 || !joined}
-              >
-                {room?.isPlaying ? "Pause" : "Play"}
-              </button>
-              <button
-                className="btn"
-                onClick={() => jump(1)}
-                disabled={
-                  !room || room.currentIndex >= (room?.queue.length || 0) - 1
-                }
-              >
-                Next ›
-              </button>
+            <div className="stage-body">
+              {currentTrack ? (
+                <>
+                  <h1 className="track-title">{currentTrack.title}</h1>
+                  {currentTrack.author && <p className="track-author">{currentTrack.author}</p>}
+                  <div className="progress" aria-hidden="true">
+                    <div
+                      className="fill"
+                      style={{ width: dur > 0 ? `${Math.min(100, (cur / dur) * 100)}%` : "0%" }}
+                    />
+                  </div>
+                  <div className="times">
+                    <span>{fmt(cur)}</span>
+                    <span>{fmt(dur)}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <h1 className="track-title quiet">
+                    {isHost ? "The room is open." : "Waiting for the first track."}
+                  </h1>
+                  <p className="track-author">
+                    {isHost
+                      ? "Paste a YouTube link below and press play."
+                      : "The host is picking something."}
+                  </p>
+                </>
+              )}
+
+              {isHost ? (
+                <div className="controls">
+                  <button
+                    className="btn"
+                    onClick={() => jump(-1)}
+                    disabled={!room || room.currentIndex === 0 || !joined}
+                  >
+                    Previous
+                  </button>
+                  <button
+                    className="btn btn-accent play"
+                    onClick={togglePlay}
+                    disabled={!room || queue.length === 0 || !joined}
+                  >
+                    {room?.isPlaying ? "Pause" : "Play"}
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => jump(1)}
+                    disabled={!room || room.currentIndex >= queue.length - 1 || !joined}
+                  >
+                    Next
+                  </button>
+                </div>
+              ) : (
+                <p className="note">The host is driving. You stay in sync automatically.</p>
+              )}
             </div>
-          ) : (
-            <p className="listener-note">
-              You're listening along — the host controls playback.
-            </p>
-          )}
-        </section>
+          </section>
 
-        <aside className="queue-panel">
-          <h2>
-            Queue <span>· {room?.queue.length || 0} tracks</span>
-          </h2>
+          <section className="queue">
+            <div className="section-head">
+              <h2>Up next</h2>
+              <span className="count">
+                {queue.length} {queue.length === 1 ? "track" : "tracks"}
+              </span>
+            </div>
 
-          {isHost && (
-            <>
-              <form className="add-row" onSubmit={addTrack}>
+            {isHost && (
+              <form className="add" onSubmit={addTrack}>
                 <input
                   className="field"
                   placeholder="Paste a YouTube link"
@@ -433,83 +547,184 @@ export default function RoomPage() {
                   aria-label="YouTube link"
                 />
                 <button className="btn btn-accent" disabled={adding || !url.trim()}>
-                  Add
+                  {adding ? "Adding…" : "Add to queue"}
                 </button>
               </form>
-              {addError && <p className="add-error">{addError}</p>}
-            </>
-          )}
-
-          <ul className="queue-list">
-            {room?.queue.map((t, i) => (
-              <li
-                key={t.id}
-                className={`queue-item ${i === room.currentIndex ? "current" : ""}`}
-              >
-                <img src={t.thumbnail} alt="" loading="lazy" />
-                <div className="meta">
-                  <div className="t">{t.title}</div>
-                  <div className="a">{t.author}</div>
-                </div>
-                {isHost && (
-                  <div className="ops">
-                    <button
-                      className="btn-icon"
-                      title="Move up"
-                      onClick={() => act({ action: "moveTrack", trackId: t.id, dir: "up" })}
-                      disabled={i === 0}
-                    >
-                      ↑
-                    </button>
-                    <button
-                      className="btn-icon"
-                      title="Move down"
-                      onClick={() => act({ action: "moveTrack", trackId: t.id, dir: "down" })}
-                      disabled={i === room.queue.length - 1}
-                    >
-                      ↓
-                    </button>
-                    <button
-                      className="btn-icon"
-                      title="Remove"
-                      onClick={() => act({ action: "removeTrack", trackId: t.id })}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-              </li>
-            ))}
-            {room && room.queue.length === 0 && (
-              <li className="queue-empty">Nothing queued yet.</li>
             )}
-          </ul>
+            {addError && <p className="form-error">{addError}</p>}
+
+            <ol className="tracks">
+              {queue.map((t, i) => (
+                <li
+                  key={t.id}
+                  className={`track ${i === room.currentIndex ? "current" : ""} ${
+                    i < room.currentIndex ? "played" : ""
+                  }`}
+                >
+                  <span className="num">{i + 1}</span>
+                  <img src={t.thumbnail} alt="" loading="lazy" />
+                  <div className="meta">
+                    <div className="t">{t.title}</div>
+                    {t.author && <div className="a">{t.author}</div>}
+                  </div>
+                  {isHost && (
+                    <div className="ops">
+                      <button
+                        className="btn-icon"
+                        title="Move up"
+                        aria-label="Move up"
+                        onClick={() => act({ action: "moveTrack", trackId: t.id, dir: "up" })}
+                        disabled={i === 0}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        className="btn-icon"
+                        title="Move down"
+                        aria-label="Move down"
+                        onClick={() => act({ action: "moveTrack", trackId: t.id, dir: "down" })}
+                        disabled={i === queue.length - 1}
+                      >
+                        ↓
+                      </button>
+                      <button
+                        className="btn-icon"
+                        title="Remove from queue"
+                        aria-label="Remove from queue"
+                        onClick={() => act({ action: "removeTrack", trackId: t.id })}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  )}
+                </li>
+              ))}
+              {room && queue.length === 0 && (
+                <li className="tracks-empty">
+                  {isHost
+                    ? "Nothing queued yet. Add a link to get started."
+                    : "Nothing queued yet."}
+                </li>
+              )}
+            </ol>
+          </section>
+        </div>
+
+        <aside className="side-col">
+          <section className="people">
+            <div className="section-head">
+              <h2>Here now</h2>
+              <span className="count">{others}</span>
+            </div>
+            <ul className="people-list">
+              {listeners.map((l) => {
+                const isMe = me && l.clientId === me.clientId;
+                return (
+                  <li key={l.clientId} className={l.host ? "is-host" : ""}>
+                    <span className="avatar" aria-hidden="true">
+                      {(l.name || "?").slice(0, 1).toUpperCase()}
+                    </span>
+                    <span className="pname">
+                      {l.name}
+                      {isMe && <em> (you)</em>}
+                    </span>
+                    {l.host && <span className="tag">host</span>}
+                    {isHost && !l.host && !isMe && (
+                      <button
+                        className="btn-icon"
+                        title={`Remove ${l.name}`}
+                        onClick={() => act({ action: "kick", targetId: l.clientId })}
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+              {joined && listeners.length === 0 && (
+                <li className="people-empty">Just you so far. Share the invite.</li>
+              )}
+            </ul>
+          </section>
+
+          <section className="chat">
+            <div className="section-head">
+              <h2>Chat</h2>
+            </div>
+            <div className="chat-log" ref={chatLogRef}>
+              {messages.length === 0 && (
+                <p className="chat-empty">Say hi. Messages stay while the room is open.</p>
+              )}
+              {messages.map((m) => {
+                const mine = me && m.clientId === me.clientId;
+                return (
+                  <div key={m.id} className={`msg ${mine ? "mine" : ""}`}>
+                    <div className="msg-head">
+                      <span className="msg-name">
+                        {mine ? "You" : m.name}
+                        {m.host && !mine && <span className="tag">host</span>}
+                      </span>
+                      <time dateTime={new Date(m.at).toISOString()}>{clock(m.at)}</time>
+                    </div>
+                    <p className="msg-text">{m.text}</p>
+                  </div>
+                );
+              })}
+            </div>
+            <form className="chat-form" onSubmit={sendChat}>
+              <input
+                className="field"
+                placeholder={joined ? "Message everyone" : "Join to chat"}
+                value={chatInput}
+                maxLength={300}
+                onChange={(e) => setChatInput(e.target.value)}
+                disabled={!joined}
+                aria-label="Chat message"
+              />
+              <button className="btn" disabled={!joined || sending || !chatInput.trim()}>
+                Send
+              </button>
+            </form>
+          </section>
         </aside>
       </div>
 
-      {!joined && room && (
+      {!joined && status === "ok" && me && (
         <div className="overlay">
-          <div className="overlay-card">
-            <h2>
-              {isHost ? "Your room is ready" : `You're invited to ${code}`}
-            </h2>
-            <p>
-              {isHost
-                ? "Step in to start queuing and playing music."
-                : "Tap below to join and hear what's playing."}
+          <form className="door" onSubmit={join}>
+            <p className="door-code">Room {code}</p>
+            <h2>{isHost ? "Your room is open" : "You're invited"}</h2>
+            <p className="door-lede">
+              {others === 0
+                ? isHost
+                  ? "Step in, then share the invite from the top bar."
+                  : "You'd be the first one here."
+                : `${others} ${others === 1 ? "person is" : "people are"} already here.`}
             </p>
-            <button className="btn btn-accent" onClick={join}>
-              {isHost ? "Enter the room" : "Join the session"}
+            <label className="door-field">
+              <span>Your name</span>
+              <input
+                className="field"
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                maxLength={24}
+                autoFocus
+                autoComplete="nickname"
+                placeholder="What should we call you?"
+              />
+            </label>
+            <button className="btn btn-accent" disabled={!nameInput.trim()}>
+              {isHost ? "Step in" : "Join and listen"}
             </button>
-          </div>
+          </form>
         </div>
       )}
 
       {joined && blocked && (
         <div className="overlay">
-          <div className="overlay-card">
-            <h2>Playback paused by your browser</h2>
-            <p>Tap to resume listening in sync.</p>
+          <div className="door">
+            <h2>Your browser paused playback</h2>
+            <p className="door-lede">Tap once to pick up where everyone is.</p>
             <button
               className="btn btn-accent"
               onClick={() => {
@@ -522,6 +737,23 @@ export default function RoomPage() {
           </div>
         </div>
       )}
+    </main>
+  );
+}
+
+function Notice({ title, children }) {
+  return (
+    <main className="home">
+      <div className="home-card">
+        <a className="wordmark" href="/">
+          Waveroom
+        </a>
+        <h1 className="notice-title">{title}</h1>
+        <p className="lede">{children}</p>
+        <a className="btn btn-accent" href="/">
+          Start a new room
+        </a>
+      </div>
     </main>
   );
 }
